@@ -16,12 +16,12 @@ def run(cmd):
     print(">>>", " ".join(cmd))
     r = subprocess.run(cmd)
     if r.returncode:
-        print(f"❌ Command failed: {' '.join(cmd)}")
+        print(f"Command failed: {' '.join(cmd)}")
         sys.exit(r.returncode)
 
 def main():
     if not DATA_ROOT.exists():
-        print(f"❌ Dataset folder not found at {DATA_ROOT}")
+        print(f"Dataset folder not found at {DATA_ROOT}")
         sys.exit(1)
 
     # TRAIN (reuse same run dir)
@@ -43,7 +43,7 @@ def main():
     best2 = run_dir / 'best.pt'
     checkpoint = best1 if best1.exists() else best2
     if not checkpoint.exists():
-        print(f"❌ Cannot find best.pt in {best1} or {best2}")
+        print(f"Cannot find best.pt in {best1} or {best2}")
         sys.exit(1)
 
     run([
