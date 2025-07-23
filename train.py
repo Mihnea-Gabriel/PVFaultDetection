@@ -1,229 +1,170 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-# ── silence specific PIL transparency warning ─────────────────────────
+import os
+import argparse
+import torch
+from torch import nn, optim
+from torchvision import transforms, datasets
+from torch.utils.data import DataLoader, random_split
+from sklearn.metrics import classification_report, accuracy_score
+from ultralytics import YOLO
+import numpy as np
+from pathlib import Path
+from datetime import datetime
 import warnings
 warnings.filterwarnings(
-    "ignore",
-    message="Palette images with Transparency expressed in bytes should be converted to RGBA images",
+    'ignore',
+    message='Palette images with Transparency expressed in bytes should be converted to RGBA images'
 )
 
-# ── stdlib / third-party ──────────────────────────────────────────────
-import argparse
-from datetime import datetime
-from pathlib import Path
 
-import numpy as np
-from PIL import Image
+def split_dataset(dataset, train_ratio, val_ratio, test_ratio, seed):
+    total = len(dataset)
+    train_len = int(train_ratio * total)
+    val_len = int(val_ratio * total)
+    test_len = total - train_len - val_len
+    lengths = [train_len, val_len, test_len]
+    generator = torch.Generator().manual_seed(seed)
+    return random_split(dataset, lengths, generator=generator)
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms, models
-from sklearn.metrics import classification_report, accuracy_score
+class BaseClassification:
+    def __init__(self, data_dir, batch_size, epochs, lr, workers, seed,
+                 train_ratio, val_ratio, test_ratio, imgsz=224):
+        self.data_dir = data_dir
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.lr = lr
+        self.workers = workers
+        self.seed = seed
+        self.train_ratio = train_ratio
+        self.val_ratio = val_ratio
+        self.test_ratio = test_ratio
+        self.imgsz = imgsz
 
-# Ultralytics YOLOv8 backbone
-try:
-    from ultralytics import YOLO
-except ImportError:
-    YOLO = None  # raised later if user picks yolov8*
+        torch.manual_seed(self.seed)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# ───────────────────────── trainer class ──────────────────────────────
-class ImageClassificationTrainer:
-    def __init__(self, data_root: Path, arch: str, epochs: int,
-                 batch_size: int, lr: float, imgsz: int,
-                 output_dir: Path, device: torch.device):
-
-        self.data_root   = data_root
-        self.arch        = arch
-        self.epochs      = epochs
-        self.batch_size  = batch_size
-        self.lr          = lr
-        self.imgsz       = imgsz
-        self.output_dir  = output_dir
-        self.device      = device
-
-        # ── transforms (RGB enforced) ────────────────────────────────
-        rgbify = transforms.Lambda(
-            lambda img: img.convert("RGB") if isinstance(img, Image.Image) else img
-        )
-        train_tf = transforms.Compose([
-            rgbify,
-            transforms.RandomResizedCrop(self.imgsz),
-            transforms.RandomHorizontalFlip(),
+        transform = transforms.Compose([
+            transforms.Resize((self.imgsz, self.imgsz)),
             transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406],
-                                 [0.229, 0.224, 0.225]),
-        ])
-        val_tf = transforms.Compose([
-            rgbify,
-            transforms.Resize(self.imgsz + 32),
-            transforms.CenterCrop(self.imgsz),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406],
-                                 [0.229, 0.224, 0.225]),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
 
-        # ── datasets / loaders ───────────────────────────────────────
-        self.train_loader = DataLoader(
-            datasets.ImageFolder(self.data_root / 'train', transform=train_tf),
-            batch_size=self.batch_size, shuffle=True,
-            num_workers=4, pin_memory=True,
-        )
-        self.val_loader = DataLoader(
-            datasets.ImageFolder(self.data_root / 'val', transform=val_tf),
-            batch_size=self.batch_size, shuffle=False,
-            num_workers=4, pin_memory=True,
-        )
-        self.test_loader = DataLoader(
-            datasets.ImageFolder(self.data_root / 'test', transform=val_tf),
-            batch_size=self.batch_size, shuffle=False,
-            num_workers=4, pin_memory=True,
-        )
-        self.num_classes = len(self.train_loader.dataset.classes)
+        dataset = datasets.ImageFolder(self.data_dir, transform=transform)
+        self.classes = dataset.classes
+        self.train_ds, self.val_ds, self.test_ds = split_dataset(
+            dataset, self.train_ratio, self.val_ratio, self.test_ratio, self.seed)
 
-        # ── build model ──────────────────────────────────────────────
-        self.model = self._build_backbone().to(self.device)
+        self.train_loader = DataLoader(self.train_ds, batch_size=self.batch_size,
+                                       shuffle=True, num_workers=self.workers, pin_memory=True, prefetch_factor=2, persistent_workers=True)
+        self.val_loader = DataLoader(self.val_ds, batch_size=self.batch_size,
+                                     shuffle=False, num_workers=self.workers, pin_memory=True, prefetch_factor=2, persistent_workers=True)
+        self.test_loader = DataLoader(self.test_ds, batch_size=self.batch_size,
+                                      shuffle=False, num_workers=self.workers, pin_memory=True, prefetch_factor=2, persistent_workers=True)
 
-        # ── loss & optimiser ─────────────────────────────────────────
+class YOLOClassification(BaseClassification):
+    def __init__(self, *args, arch='yolov8n-cls', **kwargs):
+        super().__init__(*args, **kwargs)
+        self.arch = arch
+        self.model = self._build_backbone()
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
 
-        # output dir
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+    def _safe_load_yolo(self):
+        weight = f"{self.arch}.pt"
+        if os.path.isfile(weight):
+            return YOLO(weight)
+        try:
+            return YOLO(weight)
+        except Exception:
+            cfg = f"{self.arch}.yaml"
+            return YOLO(cfg) if os.path.isfile(cfg) else YOLO(model=None, task='classify')
 
-    # -------------------------------------------------IMAGENET1K_V1----------------
-    def _build_backbone(self) -> nn.Module:
-        if self.arch.startswith("yolov8"):
-            if YOLO is None:
-                raise RuntimeError("Ultralytics not installed: pip install ultralytics")
-            y = YOLO(f"{self.arch}.pt")          # downloads weights if absent
-            backbone = y.model                   # raw nn.Module
-        else:
-            backbone = getattr(models, self.arch)(weights="IMAGENET1K_V1")
-
-        # replace final fc / classifier
+    def _build_backbone(self):
+        if not self.arch.startswith('yolov8'):
+            raise RuntimeError('arch must start with yolov8')
+        yolo = self._safe_load_yolo()
+        backbone = yolo.model
         for name, module in reversed(list(backbone.named_modules())):
             if isinstance(module, nn.Linear):
                 parent = backbone
-                *path, child = name.split(".")
+                *path, child = name.split('.')
                 for p in path:
                     parent = getattr(parent, p)
-                in_f = module.in_features
-                setattr(parent, child, nn.Linear(in_f, self.num_classes))
+                setattr(parent, child, nn.Linear(module.in_features, len(self.classes)))
                 break
-        else:
-            raise RuntimeError("No nn.Linear layer found to replace.")
-        return backbone
+        return backbone.to(self.device)
 
-    # ───────────── training / evaluation helpers ─────────────────────
     def _forward(self, imgs):
-        """Forward pass that returns logits tensor regardless of backbone."""
         out = self.model(imgs)
-        if isinstance(out, (tuple, list)):   # YOLOv8 returns (logits,)
-            out = out[0]
-        return out
+        return out[0] if isinstance(out, (tuple, list)) else out
 
-    def _run_epoch(self, loader, train: bool):
+    def _run_epoch(self, loader, train=True):
         self.model.train() if train else self.model.eval()
-        loss_sum, preds_all, labels_all = 0.0, [], []
-
-        for imgs, labels in loader:
-            imgs, labels = imgs.to(self.device), labels.to(self.device)
+        total_loss, preds, labels = 0.0, [], []
+        for imgs, lbls in loader:
+            imgs, lbls = imgs.to(self.device), lbls.to(self.device)
             with torch.set_grad_enabled(train):
                 logits = self._forward(imgs)
-                loss   = self.criterion(logits, labels)
+                loss = self.criterion(logits, lbls)
             if train:
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
-
-            loss_sum += loss.item() * imgs.size(0)
-            preds_all.append(logits.argmax(1).cpu().numpy())
-            labels_all.append(labels.cpu().numpy())
-
-        avg_loss = loss_sum / len(loader.dataset)
-        acc      = accuracy_score(np.concatenate(labels_all),
-                                  np.concatenate(preds_all))
+            total_loss += loss.item() * imgs.size(0)
+            preds.append(logits.argmax(1).cpu().numpy())
+            labels.append(lbls.cpu().numpy())
+        avg_loss = total_loss / len(loader.dataset)
+        acc = accuracy_score(np.concatenate(labels), np.concatenate(preds))
         return avg_loss, acc
 
-    # ─────────────── main training loop ──────────────────────────────
     def fit(self):
-        best_acc = 0.0
-        best_ckp = self.output_dir / 'best_model.pth'
-
+        best_acc, best_ckp = 0.0, Path('best_yolo.pth')
         for epoch in range(1, self.epochs + 1):
-            tr_loss, tr_acc = self._run_epoch(self.train_loader, train=True)
-            vl_loss, vl_acc = self._run_epoch(self.val_loader, train=False)
-            print(f"Epoch {epoch:02d}/{self.epochs:02d} "
-                  f"Train {tr_loss:.4f}/{tr_acc:.4f} | "
-                  f"Val {vl_loss:.4f}/{vl_acc:.4f}")
-
+            tr_loss, tr_acc = self._run_epoch(self.train_loader, True)
+            vl_loss, vl_acc = self._run_epoch(self.val_loader, False)
+            print(f"Epoch {epoch}/{self.epochs} Train {tr_loss:.4f}/{tr_acc:.4f} | Val {vl_loss:.4f}/{vl_acc:.4f}")
             if vl_acc > best_acc:
                 best_acc = vl_acc
                 torch.save(self.model.state_dict(), best_ckp)
-
-        print(f"Best val accuracy: {best_acc:.4f}")
+        print(f"Best val acc: {best_acc:.4f}")
         return best_ckp
 
-    # ───────────────────────── test & rename ─────────────────────────
-    def test(self, checkpoint: Path):
+    def test(self, checkpoint):
         self.model.load_state_dict(torch.load(checkpoint, map_location=self.device))
-        ts_loss, ts_acc = self._run_epoch(self.test_loader, train=False)
-
-        preds_all, labels_all = [], []
-        for imgs, labels in self.test_loader:
-            logits = self._forward(imgs.to(self.device))
-            preds_all.append(logits.argmax(1).cpu().numpy())
-            labels_all.append(labels.numpy())
-
+        ts_loss, ts_acc = self._run_epoch(self.test_loader, False)
         print(f"Test loss/acc: {ts_loss:.4f}/{ts_acc:.4f}")
-        print(classification_report(
-            np.concatenate(labels_all), np.concatenate(preds_all),
-            target_names=self.test_loader.dataset.classes,
-        ))
-
-        # rename checkpoint with timestamp + test acc
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        new_ckpt  = checkpoint.with_name(f"{timestamp}_acc={ts_acc:.3f}.pth")
-        checkpoint.rename(new_ckpt)
-        print(f"Checkpoint saved as {new_ckpt.name}")
-
-# ───────────────────────── CLI / entry-point ──────────────────────────
-def parse_args():
-    p = argparse.ArgumentParser(description="Torch + YOLOv8 solar-panel classifier")
-    p.add_argument('--data-root', type=Path, default=Path('split_solarpanel'))
-    p.add_argument('--arch', default='yolov8n-cls',
-                   help="e.g. yolov8n-cls, yolov8m-cls, resnet18, mobilenet_v3_large …")
-    p.add_argument('--epochs', type=int, default=30)
-    p.add_argument('--batch-size', type=int, default=64)
-    p.add_argument('--lr', type=float, default=1e-3)
-    p.add_argument('--imgsz', type=int, default=224)
-    p.add_argument('--output-dir', type=Path, default=Path('runs/solarpanel_chkpt'))
-    return p.parse_args()
-
-def main():
-    args   = parse_args()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print("Torch version :", torch.__version__)
-    print("CUDA available:", torch.cuda.is_available())
-    if torch.cuda.is_available():
-        print("GPU:", torch.cuda.get_device_name(0))
-
-    trainer = ImageClassificationTrainer(
-        data_root=args.data_root,
-        arch=args.arch,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        imgsz=args.imgsz,
-        output_dir=args.output_dir,
-        device=device
-    )
-
-    best_path = trainer.fit()
-    trainer.test(best_path)
+        all_preds, all_labels = [], []
+        for imgs, lbls in self.test_loader:
+            logits = self._forward(imgs.to(self.device))
+            all_preds.append(logits.argmax(1).cpu().numpy())
+            all_labels.append(lbls.numpy())
+        print(classification_report(np.concatenate(all_labels), np.concatenate(all_preds), target_names=self.classes))
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        new_ckp = Path(checkpoint).with_name(f"{ts}_acc={ts_acc:.3f}.pth")
+        Path(checkpoint).rename(new_ckp)
+        print(f"Saved checkpoint: {new_ckp.name}")
 
 if __name__ == '__main__':
-    main()
+    torch.backends.cudnn.benchmark = True
+    parser = argparse.ArgumentParser(description='YOLOv8 solar panel classifier')
+    parser.add_argument('--data-dir', required=True)
+    parser.add_argument('--model', default='yolov8n-cls', help='YOLOv8 model name')
+    parser.add_argument('--batch-size', type=int, default=32)
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--imgsz', type=int, default=224)
+    parser.add_argument('--train-ratio', type=float, default=0.7)
+    parser.add_argument('--val-ratio', type=float, default=0.15)
+    parser.add_argument('--test-ratio', type=float, default=0.15)
+    parser.add_argument('--seed', type=int, default=42)
+    args = parser.parse_args()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Running on {'GPU' if device.type=='cuda' else 'CPU'} ({device})")
+    clf = YOLOClassification(
+        args.data_dir, args.batch_size, args.epochs,
+        args.lr, args.workers, args.seed,
+        args.train_ratio, args.val_ratio, args.test_ratio,
+        args.imgsz, arch=args.model
+    )
+    ckp = clf.fit()
+    clf.test(ckp)
