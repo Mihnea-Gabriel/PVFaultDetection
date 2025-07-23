@@ -84,18 +84,39 @@ class YOLOClassification(BaseClassification):
             return YOLO(cfg) if os.path.isfile(cfg) else YOLO(model=None, task='classify')
 
     def _build_backbone(self):
+        """
+        Load a YOLO-v8 backbone and **insert a small projection head**
+        (BN → ReLU → Dropout → Linear) in front of the final classifier.
+        """
         if not self.arch.startswith('yolov8'):
             raise RuntimeError('arch must start with yolov8')
+
         yolo = self._safe_load_yolo()
-        backbone = yolo.model
+        backbone = yolo.model                                         # full nn.Module
+
+        # ── locate the last Linear (the original classifier) ───────────────
         for name, module in reversed(list(backbone.named_modules())):
             if isinstance(module, nn.Linear):
                 parent = backbone
-                *path, child = name.split('.')
-                for p in path:
+                *path, child_name = name.split('.')
+                for p in path:                                         # walk down to the parent
                     parent = getattr(parent, p)
-                setattr(parent, child, nn.Linear(module.in_features, len(self.classes)))
+                in_features = module.in_features
+
+                # ── NEW projection head ────────────────────────────────────
+                hidden = max(128, in_features // 2)                     # e.g. 512 for yolov8-n
+                new_head = nn.Sequential(
+                    nn.BatchNorm1d(in_features),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(0.25),
+                    nn.Linear(in_features, hidden, bias=False),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(hidden, len(self.classes), bias=True),
+                )
+
+                setattr(parent, child_name, new_head)                  # replace in-place
                 break
+
         return backbone.to(self.device)
 
     def _forward(self, imgs):
